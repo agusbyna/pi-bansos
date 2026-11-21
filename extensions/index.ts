@@ -24,7 +24,12 @@ import {
 	DEFAULT_MAX_HOPS,
 	tlsCustomFetch,
 	WarpHopEngine,
+	type HopResult,
 } from "./warp-hop.ts";
+import {
+	ProactiveHopPolicy,
+	proactiveHopSettingsFromEnv,
+} from "./proactive-hop.ts";
 import {
 	buildKiloFallbackBody,
 	DEFAULT_KILO_FALLBACK_MODEL,
@@ -764,6 +769,8 @@ type WarpConfig = {
 	proxyUrl?: string;
 	autoHop?: boolean;
 	maxHops?: number;
+	/** Rotate the /64 ahead of the free quota instead of after a 429 (default: on). */
+	proactive?: boolean;
 };
 type RelayState = {
 	enabled: boolean;
@@ -787,6 +794,7 @@ function loadRelayState(): RelayState {
 						? { proxyUrl: rawWarp.proxyUrl.trim() }
 						: {}),
 					autoHop: rawWarp.autoHop !== false,
+					proactive: rawWarp.proactive !== false,
 					...(typeof rawWarp.maxHops === "number" && rawWarp.maxHops > 0
 						? { maxHops: Math.floor(rawWarp.maxHops) }
 						: {}),
@@ -919,6 +927,163 @@ async function ensureWarpBinariesForAutoHop(): Promise<boolean> {
 		})();
 	}
 	return warpAutoSetupPromise;
+}
+
+// ── Proactive WARP /64 rotation ────────────────────────────────────
+// The recovery above is reactive: it runs once a turn has already been
+// refused. OpenCode's free quota is metered per egress IP, so a busy session
+// spends a /64's budget long before UTC midnight — rotate ahead of the wall
+// instead. `BANSOS_WARP_PROACTIVE=0` and `/bansos warp proactive off` opt out
+// (leaving the reactive recovery in place).
+const proactivePolicy = new ProactiveHopPolicy(proactiveHopSettingsFromEnv());
+// A turn waits for a rotation already in flight (the tunnel is down mid-hop,
+// and going direct would spend the real IP's quota) but never longer than this.
+const PROACTIVE_HOP_WAIT_MS = 20_000;
+let warpWarmPromise: Promise<void> | null = null;
+
+/** True when this process may rotate the OpenCode egress on its own. */
+function proactiveHopAllowed(): boolean {
+	return (
+		WARP_AUTO_RECOVERY &&
+		proactivePolicy.getSettings().enabled &&
+		relayState.warp?.autoHop !== false &&
+		relayState.warp?.proactive !== false &&
+		!process.env.BANSOS_OPENCODE_PROXY?.trim() &&
+		!relayState.warp?.proxyUrl
+	);
+}
+
+/** Rotate, and keep the proactive budget in step with the new block. */
+async function hopAndTrack(
+	opts: { force?: boolean; burnCurrent?: boolean } = {},
+): Promise<HopResult> {
+	const res = await warpEngine.hop(opts);
+	// A hop that came back on the same or a spent /64 is not a rotation.
+	if (res.ok && !res.samePrefix) proactivePolicy.noteHop();
+	return res;
+}
+
+/** Race a hop against a deadline: a stuck registration must not wedge a turn. */
+function waitForHop(pending: Promise<unknown>, ms: number): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<void>((resolve) => {
+		timer = setTimeout(resolve, ms);
+	});
+	return Promise.race([
+		pending.then(
+			() => undefined,
+			() => undefined,
+		),
+		deadline,
+	]).then(() => {
+		if (timer) clearTimeout(timer);
+	});
+}
+
+/**
+ * Start the WARP tunnel (installing the binaries if needed) and rotate to a
+ * fresh /64 in the background, so the session's first turn already leaves from
+ * a clean block instead of the previous run's spent one.
+ */
+function warmProactiveWarp(reason: string): Promise<void> {
+	if (!proactiveHopAllowed()) return Promise.resolve();
+	if (warpWarmPromise) return warpWarmPromise;
+	// Already up and not due for a rotation (nor on a spent block): nothing to warm.
+	if (
+		warpEngine.getStatus().running &&
+		!proactivePolicy.decision().hop &&
+		!warpEngine.currentBurnt()
+	)
+		return Promise.resolve();
+	warpWarmPromise = (async () => {
+		try {
+			if (!warpEngine.hasBinaries()) {
+				log("info", "WARP proactive warm-up: installing binaries", { reason });
+				if (!(await ensureWarpBinariesForAutoHop())) return;
+			}
+			if (!(await warpEngine.ensureStarted())) {
+				log("warn", "WARP proactive warm-up: tunnel unavailable, staying direct", {
+					reason,
+					error: warpEngine.getStatus().lastError,
+				});
+				return;
+			}
+			if (!warpAutoActivated) {
+				warpAutoActivated = true;
+				log("info", "WARP proactive egress active", {
+					reason,
+					ip: warpEngine.getStatus().lastIp,
+				});
+			}
+			// The persisted account can come back on a block spent earlier today.
+			const burnt =
+				warpEngine.currentBurnt() && !proactivePolicy.isBackingOff();
+			const decision = proactivePolicy.decision();
+			if (!decision.hop && !burnt) return;
+			log("info", "WARP proactive warm-up: rotating /64", {
+				reason: burnt ? "spent block" : decision.reason,
+				detail: burnt ? "this /64 already hit the free wall today" : decision.detail,
+			});
+			const hop = await hopAndTrack({ force: burnt });
+			if (!hop.ok || hop.samePrefix) {
+				proactivePolicy.noteHopFailure();
+				log("warn", "WARP proactive warm-up hop failed", {
+					error: hop.error ?? "tunnel came back on the same or a spent /64",
+				});
+			}
+		} catch (e) {
+			log("warn", "WARP proactive warm-up failed", { error: String(e) });
+		} finally {
+			warpWarmPromise = null;
+		}
+	})();
+	return warpWarmPromise;
+}
+
+/**
+ * Called once per OpenCode turn, before dispatch: wait out a rotation that is
+ * already running, then rotate if this /64 has done its share of the quota.
+ */
+async function proactiveTurnOpening(
+	clientKey: string,
+	model: string,
+): Promise<void> {
+	const inFlight = warpEngine.pendingHop();
+	if (inFlight) {
+		await waitForHop(inFlight, PROACTIVE_HOP_WAIT_MS);
+		return;
+	}
+	if (!proactiveHopAllowed()) return;
+	proactivePolicy.noteRequest();
+	// A block already marked spent today goes now, whatever the turn budget says,
+	// unless the last rotation failed and is waiting out its backoff.
+	const burnt =
+		warpEngine.currentBurnt() && !proactivePolicy.isBackingOff();
+	const decision = proactivePolicy.decision();
+	if (!decision.hop && !burnt) return;
+	if (!warpEngine.getStatus().running) {
+		// Tunnel down (cold start, or it dropped): warm it in the background
+		// rather than stalling this turn on a binary install.
+		void warmProactiveWarp("turn");
+		return;
+	}
+	log("info", "proactive WARP /64 rotation before turn", {
+		model,
+		reason: burnt ? "spent block" : decision.reason,
+		detail: burnt ? "this /64 already hit the free wall today" : decision.detail,
+	});
+	const hop = await hopAndTrack({ force: burnt });
+	if (hop.ok && !hop.samePrefix) {
+		warpAutoActivated = true;
+		// The rejected egress carried the session: mint a fresh one.
+		burnOpenCodeSession(clientKey);
+	} else {
+		proactivePolicy.noteHopFailure();
+		log("warn", "proactive WARP hop failed", {
+			model,
+			error: hop.error ?? "tunnel came back on the same or a spent /64",
+		});
+	}
 }
 
 // ── Relay pool health & failover ───────
@@ -2415,6 +2580,10 @@ function startProxy(
 					const warpCfg = relayState.warp;
 					const maxHops = warpCfg?.maxHops ?? DEFAULT_MAX_HOPS;
 
+					// Proactive /64 rotation: spend a fresh egress before the free
+					// quota runs out instead of discovering the wall with a 429.
+					await proactiveTurnOpening(clientKey, model);
+
 					while (!reqAbort.signal.aborted) {
 						const signal = AbortSignal.any([
 							reqAbort.signal,
@@ -2589,7 +2758,13 @@ function startProxy(
 									});
 									const runtimeReady = await ensureWarpBinariesForAutoHop();
 									if (runtimeReady && !reqAbort.signal.aborted) {
-										const hopRes = await warpEngine.hop({ force: true });
+										// Only a quota wall that came through the WARP tunnel
+										// spends that /64: a request that fell back to the
+										// direct route says nothing about the block.
+										const hopRes = await hopAndTrack({
+											force: true,
+											burnCurrent: kind === "quota" && via === "warp",
+										});
 										if (
 											hopRes.ok &&
 											!hopRes.samePrefix &&
@@ -2925,7 +3100,7 @@ export default async function (pi: ExtensionAPI) {
 	// ── /bansos command: toggle relay & WARP egress live ──────────────
 	pi.registerCommand("bansos", {
 		description:
-			"Relay & WARP egress: on | off | status | warp [setup|on|off|hop|status] | url [URL] | deploy | list | use <URL> | remove <URL> | hide | show | refresh-models",
+			"Relay & WARP egress: on | off | status | warp [setup|on|off|hop|status|proactive on|off] | url [URL] | deploy | list | use <URL> | remove <URL> | hide | show | refresh-models",
 		getArgumentCompletions: (prefix: string) =>
 			[
 				"on",
@@ -2937,6 +3112,9 @@ export default async function (pi: ExtensionAPI) {
 				"warp off",
 				"warp hop",
 				"warp status",
+				"warp proactive",
+				"warp proactive on",
+				"warp proactive off",
 				"url",
 				"deploy",
 				"list",
@@ -3119,7 +3297,7 @@ export default async function (pi: ExtensionAPI) {
 				const warpOn = Boolean(relayState.warp?.enabled || warpAutoActivated);
 				const warpMode =
 					warpAutoActivated && !relayState.warp?.enabled ? "ON (auto)" : "ON";
-				const warpLine = `WARP ${warpOn ? warpMode : "OFF"} | running=${ws.running}${ws.lastIp ? ` (${ws.lastIp})` : ""} | hops=${ws.hops} | hits=${warpHits} | binaries=${ws.installed ? "installed" : "missing (/bansos warp setup)"}`;
+				const warpLine = `WARP ${warpOn ? warpMode : "OFF"} | running=${ws.running}${ws.lastIp ? ` (${ws.lastIp})` : ""} | hops=${ws.hops} | proactive=${proactivePolicy.summary()} | hits=${warpHits} | binaries=${ws.installed ? "installed" : "missing (/bansos warp setup)"}`;
 				ctx.ui.notify(
 					[
 						`Relay ${relayState.enabled ? `ON → ${relayState.url}` : "OFF (direct)"} | hits=${relayHits} | saved=${relayState.relays.length}`,
@@ -3211,9 +3389,30 @@ export default async function (pi: ExtensionAPI) {
 						) {
 							ctx.ui.notify("WARP OFF (auto-hop disabled)", "info");
 						}
+					} else if (act === "proactive") {
+						const choice = (parts[2] || "").toLowerCase();
+						const current =
+							proactivePolicy.getSettings().enabled &&
+							relayState.warp?.proactive !== false;
+						const next =
+							choice === "on" ? true : choice === "off" ? false : !current;
+						if (
+							commit((s) => {
+								s.warp = {
+									...(s.warp ?? { enabled: false }),
+									proactive: next,
+								};
+							})
+						) {
+							if (next) void warmProactiveWarp("commanded");
+							ctx.ui.notify(
+								`Proactive /64 rotation ${next ? "ON — hops before the free quota is spent" : "OFF — hops only after a 429/403"}`,
+								"info",
+							);
+						}
 					} else if (act === "hop") {
 						renderStatus(ctx.ui, "hopping WARP /64…");
-						const r = await warpEngine.hop({ force: true });
+						const r = await hopAndTrack({ force: true });
 						renderStatus(ctx.ui);
 						if (r.ok) {
 							warpAutoActivated = true;
@@ -3229,7 +3428,7 @@ export default async function (pi: ExtensionAPI) {
 						const ws = warpEngine.getStatus();
 						ctx.ui.notify(
 							[
-								`WARP: ${relayState.warp?.enabled ? "ON" : warpAutoActivated ? "ON (auto)" : "OFF"} (auto-hop: ${relayState.warp?.autoHop !== false ? "ON" : "OFF"})`,
+								`WARP: ${relayState.warp?.enabled ? "ON" : warpAutoActivated ? "ON (auto)" : "OFF"} (auto-hop: ${relayState.warp?.autoHop !== false ? "ON" : "OFF"}, proactive: ${proactivePolicy.getSettings().enabled && relayState.warp?.proactive !== false ? "ON" : "OFF"})`,
 								`tunnel: ${ws.running ? `UP (pid ${ws.pid})` : "DOWN"} → ${ws.proxyUrl}`,
 								`egress IP: ${ws.lastIp ?? "n/a"} | hops: ${ws.hops}${ws.lastHopAt ? ` (last ${ws.lastHopAt})` : ""}`,
 								`binaries: ${ws.installed ? "installed" : "missing — run /bansos warp setup"}`,
@@ -3249,6 +3448,7 @@ export default async function (pi: ExtensionAPI) {
 						"Turn WARP OFF",
 						"Hop to fresh /64 now",
 						"Install / update WARP binaries (wgcf + wireproxy)",
+						"Toggle proactive /64 rotation",
 						"Show WARP status",
 					]);
 					if (pick === "Turn WARP ON") await runWarpAction("on");
@@ -3256,6 +3456,13 @@ export default async function (pi: ExtensionAPI) {
 					else if (pick === "Hop to fresh /64 now") await runWarpAction("hop");
 					else if (pick === "Install / update WARP binaries (wgcf + wireproxy)")
 						await runWarpAction("setup");
+					else if (pick === "Toggle proactive /64 rotation")
+						await runWarpAction(
+							proactivePolicy.getSettings().enabled &&
+								relayState.warp?.proactive !== false
+								? "proactive off"
+								: "proactive on",
+						);
 					else if (pick === "Show WARP status") await runWarpAction("status");
 				}
 			} else if (sub === "refresh-models") {
@@ -3414,6 +3621,9 @@ export default async function (pi: ExtensionAPI) {
 				);
 		}
 		relayState = resolveRelayState();
+		// Warm the proactive egress in the background: the binaries are
+		// installed and the /64 rotated before a turn needs them.
+		void warmProactiveWarp("session start");
 		renderStatus(ctx.ui);
 	});
 

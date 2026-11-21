@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.3] - unreleased
+
+### Added
+- **Proactive WARP `/64` rotation (`extensions/proactive-hop.ts`, on by default)** — OpenCode meters its free tier per egress IP, so the previous behaviour (wait for the `429`, then hop) always spent a refused turn discovering the wall. The egress now rotates *ahead* of it:
+  - **Session start warms the egress** — `warmProactiveWarp()` installs the binaries if needed, starts the tunnel, and registers a fresh `/64` in the background, so the session does not begin on the previous run's (usually spent) block.
+  - **Per-turn budget** — `ProactiveHopPolicy` rotates after `rotateAfterRequests` turns on one block (default **20**) or `rotateAfterMs` on it (default **20 min**), whichever comes first, with a 45 s minimum interval and a 60 s backoff after a failed rotation.
+  - **Turns wait for a rotation in flight** (bounded to 20 s, `PROACTIVE_HOP_WAIT_MS`) instead of falling back to a direct request on the block being retired; `WarpHopEngine.pendingHop()` exposes the in-flight hop.
+  - **Reactive and manual hops reset the budget** (`hopAndTrack`), so a recovery is not immediately followed by a proactive rotation.
+  - New opt-outs and tuning: `/bansos warp proactive on|off` (persisted as `warp.proactive` in the state file), `BANSOS_WARP_PROACTIVE=0`, `BANSOS_WARP_ROTATE_EVERY`, `BANSOS_WARP_ROTATE_MINUTES`. `/bansos warp off` and `BANSOS_WARP_AUTO=0` still disable everything WARP-automatic.
+  - `/bansos warp status` and `/bansos status` report the rotation state; the WARP menu gained a `Toggle proactive /64 rotation` entry.
+  - New `tests/proactive-hop.test.ts` covers the request budget, the wall-clock net, the minimum interval, the failure backoff, the disabled state, and env parsing.
+- **Spent `/64` tracking (adapted from Opencode-Unlimited-Limit-Bypass)** — a block that hits the free wall is spent for the rest of its UTC day, and the old code only avoided the block it was leaving, so a hop could land on a sibling block that had already burned.
+  - `WarpHopEngine.markBurnt()` / `isBurnt()` / `currentBurnt()` keep a `/64 → UTC day` ledger, pruned on rollover (the allowance resets at 00:00 UTC) and persisted to `burnt-blocks.json` in the WARP data dir, so a restart does not hand a spent block back. `hopInternal` treats a burnt block as not fresh and re-registers instead of accepting it.
+  - Attribution: the reactive hop passes `burnCurrent` only when the quota `429` came through the tunnel (`via === "warp"`). A request that fell back to the direct route says nothing about the block and no longer spends it.
+  - A tunnel that comes back on a spent or unchanged block is now reported as `samePrefix` and no longer counted as a rotation by the proactive paths, so they back off instead of resetting the budget. `/bansos warp hop` keeps its explicit "(same block returned by Cloudflare)" message.
+  - A block already spent today skips the turn budget: the next turn rotates immediately (still bounded by the rotation backoff, so a failing hop cannot reconnect the tunnel on every request).
+  - New `tests/warp-hop.test.ts` case covers the mark, its persistence across an engine restart, the skip of a burnt block mid-hop, and the UTC-day expiry.
+
 ## [0.9.2] - 2026-11-21
 
 ### Added

@@ -257,6 +257,97 @@ test("WarpHopEngine: cold hop starts the tunnel and force bypasses the manual co
 	}
 });
 
+test("WarpHopEngine: a spent /64 is marked per UTC day, persisted, and skipped by hops", async () => {
+	const dir = fs.mkdtempSync(path.join(tmpdir(), "bansos-warp-burnt-"));
+	try {
+		const binDir = path.join(dir, "bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		const ext = process.platform === "win32" ? ".exe" : "";
+		fs.writeFileSync(path.join(binDir, `wgcf${ext}`), "stub", { mode: 0o755 });
+		fs.writeFileSync(path.join(binDir, `wireproxy${ext}`), "stub", { mode: 0o755 });
+
+		let clock = 1_700_000_000_000;
+		let regCounter = 0;
+		const ips = [
+			"2606:4700:110:1::10", // start
+			"2606:4700:110:2::10", // first hop: fresh
+			"2606:4700:110:3::10", // spent in the second engine: must be skipped
+			"2606:4700:110:4::10", // fresh after re-registering
+		];
+		let ipIdx = 0;
+		const makeEngine = () =>
+			new WarpHopEngine({
+				dataDir: dir,
+				proxyPort: 43997,
+				now: () => clock,
+				readyPollMs: 5,
+				readyTimeoutMs: 500,
+				killStaleFn: async () => {},
+				runCmd: async (_bin, args, cwd) => {
+					if (args[0] === "register") {
+						regCounter++;
+						fs.writeFileSync(
+							path.join(cwd, "wgcf-account.toml"),
+							`device_id = "burnt-${regCounter}"\n`,
+						);
+						return { code: 0, stdout: "ok", stderr: "" };
+					}
+					if (args[0] === "generate") {
+						fs.writeFileSync(
+							path.join(cwd, "wgcf-profile.conf"),
+							"[Interface]\nPrivateKey = dummy\n",
+						);
+						return { code: 0, stdout: "ok", stderr: "" };
+					}
+					return { code: 1, stdout: "", stderr: "unexpected" };
+				},
+				spawnDaemon: () => {
+					const fake = new EventEmitter() as any;
+					fake.pid = 33333;
+					fake.kill = () => fake.emit("exit", 0);
+					return fake;
+				},
+				traceFn: async () => ({
+					ip: ips[Math.min(ipIdx++, ips.length - 1)]!,
+					warp: "on",
+				}),
+			});
+
+		// The wall came through the tunnel on ips[0]: a hop that burns it marks
+		// that /64, and the hop itself moves to ips[1].
+		const engine = makeEngine();
+		assert.equal(await engine.ensureStarted(), true);
+		const first = await engine.hop({ force: true, burnCurrent: true });
+		assert.equal(first.ok, true);
+		assert.equal(first.samePrefix, false);
+		assert.equal(first.ip, ips[1]);
+		assert.equal(engine.isBurnt(ips[0]), true);
+		assert.equal(engine.isBurnt(ips[1]), false);
+
+		// The mark survives a restart of the engine (same data dir).
+		const restarted = makeEngine();
+		assert.equal(restarted.isBurnt(ips[0]), true);
+
+		// A hop never lands on a spent block: ips[2] is marked spent, so the
+		// first trace is re-registered and the second one (ips[3]) is taken.
+		restarted.markBurnt(ips[2]);
+		const skipped = await restarted.hop({ force: true });
+		assert.equal(skipped.ok, true);
+		assert.equal(skipped.samePrefix, false);
+		assert.equal(skipped.ip, ips[3]);
+		assert.equal(regCounter >= 3, true);
+
+		// The mark is for the UTC day only: the next day the block is fresh again.
+		clock += 86_400_000;
+		assert.equal(restarted.isBurnt(ips[2]), false);
+
+		await engine.stop();
+		await restarted.stop();
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("HTTP CONNECT tunnel rejects cleanly on non-200 proxy status", async () => {
 	const { openProxyTlsTunnel } = await import("../extensions/warp-hop.ts");
 	const server = http.createServer();

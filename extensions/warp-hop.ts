@@ -23,6 +23,12 @@ export const HOP_COOLDOWN_MS = 45_000;
 export const READY_TIMEOUT_MS = 25_000;
 export const DEFAULT_MAX_HOPS = 2;
 const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
+// A /64 that hit the free wall is spent for the rest of its UTC day: OpenCode's
+// allowance resets at 00:00 UTC, so the mark expires then and the block is
+// fresh again. Persisted in the data dir so a restart does not hand it back.
+const DAY_MS = 86_400_000;
+export const BURNT_BLOCKS_MAX = 200;
+const BURNT_BLOCKS_FILE = "burnt-blocks.json";
 
 /**
  * Normalize `wgcf-profile.conf` for `wireproxy`:
@@ -136,6 +142,12 @@ export function sameBlock(a: string | null | undefined, b: string | null | undef
 		}
 	}
 	return false;
+}
+
+/** The /64 network prefix of an IPv6 address (its first four hextets), or null. */
+export function prefix64(addr: string): string | null {
+	const expanded = expandIPv6(addr);
+	return expanded ? expanded.slice(0, 4).join(":") : null;
 }
 
 /** Open an HTTP CONNECT tunnel to `targetHost:targetPort` via `proxyUrl` and upgrade to TLS. */
@@ -553,6 +565,8 @@ export type HopResult = {
 	ok: boolean;
 	ip?: string | null;
 	samePrefix?: boolean;
+	/** The hop kept landing on a /64 already spent today (samePrefix is also set). */
+	burnt?: boolean;
 	error?: string;
 };
 export type WarpStatus = {
@@ -709,6 +723,9 @@ export class WarpHopEngine {
 	private lastError: string | null = null;
 	private starting: Promise<boolean> | null = null;
 	private hopping: Promise<HopResult> | null = null;
+	// prefix → UTC day it was marked spent
+	private readonly burnt = new Map<string, number>();
+	private readonly burntFile: string;
 
 	constructor(deps: WarpEngineDeps) {
 		this.dataDir = deps.dataDir;
@@ -726,6 +743,8 @@ export class WarpHopEngine {
 		this.readyTimeoutMs = deps.readyTimeoutMs ?? READY_TIMEOUT_MS;
 		this.readyPollMs = deps.readyPollMs ?? 750;
 		this.onLog = deps.onLog;
+		this.burntFile = path.join(this.dataDir, BURNT_BLOCKS_FILE);
+		this.loadBurnt();
 	}
 
 	findBin(name: "wgcf" | "wireproxy"): string | null {
@@ -912,11 +931,89 @@ export class WarpHopEngine {
 		return this.starting;
 	}
 
+	private loadBurnt(): void {
+		try {
+			const data = JSON.parse(fs.readFileSync(this.burntFile, "utf8"));
+			if (data && typeof data === "object") {
+				for (const [key, day] of Object.entries(data)) {
+					if (typeof day === "number") this.burnt.set(key, day);
+				}
+			}
+		} catch {
+			// No file yet, or unreadable: nothing is marked spent.
+		}
+	}
+
+	private persistBurnt(): void {
+		try {
+			fs.mkdirSync(this.dataDir, { recursive: true });
+			fs.writeFileSync(
+				this.burntFile,
+				JSON.stringify(Object.fromEntries(this.burnt)),
+				{ mode: 0o600 },
+			);
+		} catch (e) {
+			this.onLog?.("warn", "could not persist spent WARP blocks", {
+				error: String(e),
+			});
+		}
+	}
+
+	private utcDay(): number {
+		return Math.floor(this.now() / DAY_MS);
+	}
+
+	/**
+	 * Mark a /64 as spent for today (it hit the free wall). Later hops treat a
+	 * block with this prefix as a failed rotation and re-register.
+	 */
+	markBurnt(addr: string | null | undefined): boolean {
+		const key = addr ? prefix64(addr) : null;
+		if (!key) return false;
+		const day = this.utcDay();
+		for (const [k, d] of this.burnt) {
+			if (d < day) this.burnt.delete(k);
+		}
+		this.burnt.set(key, day);
+		while (this.burnt.size > BURNT_BLOCKS_MAX) {
+			const oldest = this.burnt.keys().next();
+			if (oldest.done) break;
+			this.burnt.delete(oldest.value);
+		}
+		this.persistBurnt();
+		this.onLog?.("info", "WARP /64 marked spent for today", { block: key });
+		return true;
+	}
+
+	/** True when this /64 was marked spent earlier today (UTC). */
+	isBurnt(addr: string | null | undefined): boolean {
+		const key = addr ? prefix64(addr) : null;
+		if (!key) return false;
+		const day = this.burnt.get(key);
+		return day !== undefined && day >= this.utcDay();
+	}
+
+	/** True when the block the tunnel is on now was already spent today. */
+	currentBurnt(): boolean {
+		return this.isBurnt(this.lastIp);
+	}
+
+	/**
+	 * The /64 rotation currently in flight, if any. index.ts waits on it before
+	 * a turn so a request never leaves from the block being retired (the tunnel
+	 * is down mid-hop, and a fallback to direct would spend the real IP's quota).
+	 */
+	pendingHop(): Promise<HopResult> | null {
+		return this.hopping;
+	}
+
 	/**
 	 * Rotate the outbound /64 identity: stop wireproxy, register a fresh WARP
 	 * account, regenerate profile, restart tunnel, and verify a new /64 block.
 	 */
-	async hop(opts: { force?: boolean; cooldownMs?: number } = {}): Promise<HopResult> {
+	async hop(
+		opts: { force?: boolean; cooldownMs?: number; burnCurrent?: boolean } = {},
+	): Promise<HopResult> {
 		if (this.hopping) return this.hopping;
 		this.hopping = this.hopInternal(opts).finally(() => {
 			this.hopping = null;
@@ -925,7 +1022,7 @@ export class WarpHopEngine {
 	}
 
 	private async hopInternal(
-		opts: { force?: boolean; cooldownMs?: number } = {},
+		opts: { force?: boolean; cooldownMs?: number; burnCurrent?: boolean } = {},
 	): Promise<HopResult> {
 		const cooldownMs = opts.cooldownMs ?? HOP_COOLDOWN_MS;
 		const elapsed = this.now() - this.lastHopAt;
@@ -939,6 +1036,9 @@ export class WarpHopEngine {
 		this.stopChild();
 
 		const oldIp = this.lastIp;
+		// The reactive path sets burnCurrent when the wall was hit through this
+		// tunnel: that /64 is spent for today, so no later hop may land on it.
+		if (opts.burnCurrent && oldIp) this.markBurnt(oldIp);
 		let last: HopResult = { ok: false, error: "no attempt" };
 
 		for (let attempt = 1; attempt <= 3; attempt++) {
@@ -981,8 +1081,9 @@ export class WarpHopEngine {
 			this.hops += 1;
 			this.lastIp = trace.ip;
 			this.lastError = null;
-			const fresh = !oldIp || !sameBlock(oldIp, trace.ip);
-			last = { ok: true, ip: trace.ip, samePrefix: !fresh };
+			const burntHit = this.isBurnt(trace.ip);
+			const fresh = (!oldIp || !sameBlock(oldIp, trace.ip)) && !burntHit;
+			last = { ok: true, ip: trace.ip, samePrefix: !fresh, burnt: burntHit };
 			if (fresh) {
 				this.onLog?.("info", "WARP hopped to fresh block", {
 					from: oldIp,
@@ -991,10 +1092,13 @@ export class WarpHopEngine {
 				});
 				break;
 			}
-			this.onLog?.("info", "WARP hop got same block, re-registering", {
-				ip: trace.ip,
-				attempt,
-			});
+			this.onLog?.(
+				"info",
+				burntHit
+					? "WARP hop landed on a /64 already spent today, re-registering"
+					: "WARP hop got same block, re-registering",
+				{ ip: trace.ip, attempt },
+			);
 			if (attempt < 3) this.stopChild();
 		}
 
